@@ -48,7 +48,10 @@ case "$sub" in
   key)
     [ -n "$name" ] || die "--name is required" 2
     [ ${#paths[@]} -gt 0 ] || die "at least one --path is required" 2
-    h="$(hash_paths "toolkit=$CI_TOOLKIT_VERSION" "name=$name" "${salts[@]+"${salts[@]}"}" -- "${paths[@]}")"
+    # The toolkit's own scripts are an input too: a fixed bug here must not
+    # leave markers recorded by the buggy version in force.
+    self="$(hash_paths -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
+    h="$(hash_paths "toolkit=$CI_TOOLKIT_VERSION" "toolkit-scripts=$self" "name=$name" "${salts[@]+"${salts[@]}"}" -- "${paths[@]}")"
     emit key "pass-$(slug "$name")-${h:0:24}"
     ;;
   check|save)

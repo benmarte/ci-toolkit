@@ -19,7 +19,13 @@ setup() {
 #!/usr/bin/env bash
 echo "$*" >> "$DOCKER_LOG"
 case "$1 $2 $3" in
-  "buildx imagetools inspect") for r in $FAKE_EXISTING; do [ "$r" = "$4" ] && exit 0; done; exit 1 ;;
+  "buildx imagetools inspect")
+    for r in $FAKE_EXISTING; do
+      if [ "$r" = "$4" ]; then
+        [ "$5" = "--format" ] && printf '{"mediaType":"x","digest":"%s","size":1}\n' "${FAKE_DIGEST:-sha256:aaaa}"
+        exit 0
+      fi
+    done; exit 1 ;;
   "buildx inspect "*) echo "Driver: docker-container"; exit 0 ;;
 esac
 exit 0
@@ -221,4 +227,91 @@ teardown() { rm -rf "$WORK"; }
 @test "run-tests requires a command" {
   run "$S/run-tests.sh" --image img:1
   [ "$status" -eq 2 ]
+}
+
+# ---- hashing: review regressions (false-skip classes) -----------------------
+
+h() { bash -c '. "$1/lib/common.sh"; shift; hash_paths -- "$@"' _ "$S" "$@"; }
+
+@test "an ignored directory is hashed by content, not skipped" {
+  echo 'dist/' > .gitignore && git add .gitignore && git commit -qm ig
+  mkdir -p dist && echo v1 > dist/app.js
+  a="$(h dist)"; echo v2 > dist/app.js; b="$(h dist)"
+  [ "$a" != "$b" ]
+}
+
+@test "chmod +x changes the hash" {
+  a="$(h src)"; chmod +x src/main.go; b="$(h src)"
+  [ "$a" != "$b" ]
+}
+
+@test "an edited file with a non-ASCII name changes the hash (not treated as deleted)" {
+  echo a > "src/é.txt" && git add -A && git commit -qm u
+  a="$(h src)"; echo b > "src/é.txt"; b="$(h src)"
+  rm "src/é.txt"; c="$(h src)"
+  [ "$a" != "$b" ] && [ "$b" != "$c" ] && [ "$a" != "$c" ]
+}
+
+@test "hashing from a cwd outside the repo sees the real content" {
+  a="$(h "$WORK/src")"
+  b="$(cd / && h "$WORK/src")"
+  echo '// y' >> src/main.go
+  c="$(cd / && h "$WORK/src")"
+  [ "$a" = "$b" ] && [ "$b" != "$c" ]
+}
+
+@test "hashing never touches the real index" {
+  echo '// z' >> src/main.go
+  before="$(git diff --cached --name-only)"
+  h src >/dev/null
+  [ "$(git diff --cached --name-only)" = "$before" ]
+}
+
+# ---- build-image trust (attestation) ------------------------------------------
+
+@test "an existing tag is reused when the trust file holds its digest" {
+  ref="$("$S/build-image.sh" --image reg/x --dry-run | sed -n 's/^image=//p')"
+  export FAKE_EXISTING="$ref" FAKE_DIGEST="sha256:aaaa"
+  printf 'sha256:aaaa' > trust
+  run "$S/build-image.sh" --image reg/x --trust-file trust --attest-out new
+  [[ "$output" == *"built=false"* ]]
+  ! grep -q "buildx build" "$DOCKER_LOG"
+  [ "$(cat new)" = "sha256:aaaa" ]
+}
+
+@test "an existing tag with a different digest than attested is rebuilt" {
+  ref="$("$S/build-image.sh" --image reg/x --dry-run | sed -n 's/^image=//p')"
+  export FAKE_EXISTING="$ref" FAKE_DIGEST="sha256:forged"
+  printf 'sha256:aaaa' > trust
+  run "$S/build-image.sh" --image reg/x --trust-file trust
+  [[ "$output" == *"built=true"* ]]
+  grep -q "buildx build" "$DOCKER_LOG"
+}
+
+@test "an existing tag with no attestation in scope is rebuilt" {
+  ref="$("$S/build-image.sh" --image reg/x --dry-run | sed -n 's/^image=//p')"
+  export FAKE_EXISTING="$ref"
+  : > trust
+  run "$S/build-image.sh" --image reg/x --trust-file trust
+  [[ "$output" == *"built=true"* ]]
+}
+
+@test "provenance and sbom are off by default (no untagged children to prune)" {
+  "$S/build-image.sh" --image reg/x >/dev/null
+  grep -q -- "--provenance=false --sbom=false" "$DOCKER_LOG"
+}
+
+@test "the context is part of the image hash" {
+  mkdir -p other && cp Dockerfile other/ && git add -A && git commit -qm o
+  a="$("$S/build-image.sh" --image reg/x --file Dockerfile --context . --hash-path src --dry-run | sed -n 's/^hash=//p')"
+  b="$("$S/build-image.sh" --image reg/x --file Dockerfile --context other --hash-path src --dry-run | sed -n 's/^hash=//p')"
+  [ "$a" != "$b" ]
+}
+
+@test "pass-cache keys change when the toolkit scripts change" {
+  k1="$("$S/pass-cache.sh" key --name unit --path src | sed -n 's/^key=//p')"
+  cp -R "$ROOT/scripts" "$WORK/tk"
+  echo '# edit' >> "$WORK/tk/run-tests.sh"
+  k2="$("$WORK/tk/pass-cache.sh" key --name unit --path src | sed -n 's/^key=//p')"
+  [ "$k1" != "$k2" ]
 }

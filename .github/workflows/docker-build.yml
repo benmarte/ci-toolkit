@@ -12,6 +12,12 @@
 #           docker/Dockerfile.dev
 #           go.mod
 #           go.sum
+#
+# Trust: an existing tag is reused only when this branch scope attested its
+# digest in the GitHub cache (which GitHub scopes per branch), so an image
+# pushed by another branch or forged by a job with packages:write is rebuilt,
+# not shipped. The BuildKit layer cache defaults to the GitHub cache for the
+# same reason (and because it does not count against package storage).
 name: docker-build
 on:
   workflow_call:
@@ -41,7 +47,7 @@ on:
         type: string
         default: ""
       build-args:
-        description: Newline-separated KEY=VALUE
+        description: Newline-separated KEY=VALUE. Pin base images here (e.g. a digest) — a floating FROM tag is not part of the hash.
         type: string
         default: ""
       platforms:
@@ -52,9 +58,16 @@ on:
         type: string
         default: ""
       cache-backend:
-        description: registry | gha | none
+        description: gha (default, branch-scoped, free) | registry | none
         type: string
-        default: registry
+        default: gha
+      prune-keep:
+        description: After a new build, keep this many newest versions of the image (plus the last prune-keep-days). 0 disables pruning.
+        type: number
+        default: 5
+      prune-keep-days:
+        type: number
+        default: 3
       runs-on:
         description: JSON for runs-on, e.g. '"ubuntu-latest"' or '["self-hosted","linux"]'
         type: string
@@ -66,7 +79,7 @@ on:
         type: string
         default: benmarte/ci-toolkit
       toolkit-ref:
-        description: Keep equal to the @ref you call this workflow with
+        description: Keep equal to the @ref you call this workflow with (pin both to the same sha for immutability)
         type: string
         default: v1
     secrets:
@@ -99,6 +112,8 @@ jobs:
       hash: ${{ steps.build.outputs.hash }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Cloned outside the workspace so it can never enter the build context.
       - name: Fetch ci-toolkit
         shell: bash
@@ -106,6 +121,11 @@ jobs:
           REPO: ${{ inputs.toolkit-repo }}
           REF: ${{ inputs.toolkit-ref }}
         run: |
+          # Keep registry credentials out of the runner's home (persistent on self-hosted).
+          dc="$RUNNER_TEMP/ci-toolkit-docker"; mkdir -p "$dc"
+          # CLI plugins (buildx, compose) are looked up under DOCKER_CONFIG too.
+          [ -d "$HOME/.docker/cli-plugins" ] && ln -sfn "$HOME/.docker/cli-plugins" "$dc/cli-plugins"
+          echo "DOCKER_CONFIG=$dc" >> "$GITHUB_ENV"
           d="$RUNNER_TEMP/ci-toolkit"; mkdir -p "$d"; cd "$d"
           git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
           echo "CI_TOOLKIT=$d" >> "$GITHUB_ENV"
@@ -117,8 +137,8 @@ jobs:
           USERNAME: ${{ secrets.registry-username || github.actor }}
           PASSWORD: ${{ secrets.registry-password || github.token }}
         run: printf '%s' "$PASSWORD" | docker login "${REGISTRY%%/*}" -u "$USERNAME" --password-stdin >/dev/null
-      - id: build
-        name: Build (or reuse) image
+      - id: args
+        name: Resolve inputs
         shell: bash
         env:
           IMAGE: ${{ inputs.image }}
@@ -133,16 +153,78 @@ jobs:
           EXTRA_TAGS: ${{ inputs.extra-tags }}
           CACHE_BACKEND: ${{ inputs.cache-backend }}
         run: |
-          image="${IMAGE:-$REGISTRY/${GITHUB_REPOSITORY,,}/$NAME}"
+          repo="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="${IMAGE:-$REGISTRY/$repo/$NAME}"
           args=(--image "$image" --file "$FILE" --context "$CONTEXT" --platform "$PLATFORMS" --cache-backend "$CACHE_BACKEND")
           [ -n "$TARGET" ] && args+=(--target "$TARGET")
           while IFS= read -r p; do [ -n "$p" ] && args+=(--hash-path "$p"); done <<< "$HASH_PATHS"
           while IFS= read -r a; do [ -n "$a" ] && args+=(--build-arg "$a"); done <<< "$BUILD_ARGS"
-          while IFS= read -r t; do [ -n "$t" ] && args+=(--extra-tag "$t"); done <<< "$EXTRA_TAGS"
-          CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$CI_TOOLKIT/scripts/build-image.sh" "${args[@]}"
+          # One NUL-free line per arg, read back with mapfile in later steps.
+          printf '%s\n' "${args[@]}" > "$RUNNER_TEMP/ci-toolkit-build-args"
+          printf '%s\n' "$EXTRA_TAGS" > "$RUNNER_TEMP/ci-toolkit-extra-tags"
+          dry="$("$CI_TOOLKIT/scripts/build-image.sh" "${args[@]}" --dry-run)"
+          hash="$(printf '%s\n' "$dry" | sed -n 's/^hash=//p')"
+          ref="$(printf '%s\n' "$dry" | sed -n 's/^image=//p')"
+          # shellcheck source=/dev/null
+          . "$CI_TOOLKIT/scripts/lib/common.sh"
+          digest="$(image_digest "$ref")"
+          stem="ci-toolkit-img-$(slug "${image##*/}")-${hash:0:20}"
+          # The attestation key names the exact digest: a hit means this
+          # branch scope (or the default branch) built precisely this image.
+          echo "attest-key=$stem-${digest#sha256:}" >> "$GITHUB_OUTPUT"
+          echo "stem=$stem" >> "$GITHUB_OUTPUT"
+          printf '%s' "$digest" > "$RUNNER_TEMP/ci-toolkit-expected-digest"
+          echo "package=${image#*/}" >> "$GITHUB_OUTPUT"
+          echo "owner=${repo%%/*}" >> "$GITHUB_OUTPUT"
+      - id: attest
+        name: Look up this scope's attestation
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ci-toolkit-attest
+          key: ${{ steps.args.outputs.attest-key }}
+          lookup-only: true
+      - id: build
+        name: Build (or reuse) image
+        shell: bash
+        env:
+          ATTESTED: ${{ steps.attest.outputs.cache-hit }}
+          STEM: ${{ steps.args.outputs.stem }}
+        run: |
+          mapfile -t args < "$RUNNER_TEMP/ci-toolkit-build-args"
+          while IFS= read -r t; do [ -n "$t" ] && args+=(--extra-tag "$t"); done < "$RUNNER_TEMP/ci-toolkit-extra-tags"
+          trust="$RUNNER_TEMP/ci-toolkit-trust"; : > "$trust"
+          # Trusted digest = the one the attestation key names, only on a hit.
+          [ "$ATTESTED" = "true" ] && cp "$RUNNER_TEMP/ci-toolkit-expected-digest" "$trust"
+          CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$CI_TOOLKIT/scripts/build-image.sh" "${args[@]}" \
+            --trust-file "$trust" --attest-out "$RUNNER_TEMP/ci-toolkit-new-digest"
+          if [ "$ATTESTED" != "true" ] && [ -s "$RUNNER_TEMP/ci-toolkit-new-digest" ]; then
+            d="$(cat "$RUNNER_TEMP/ci-toolkit-new-digest")"
+            mkdir -p "$RUNNER_TEMP/ci-toolkit-attest"; printf '%s' "$d" > "$RUNNER_TEMP/ci-toolkit-attest/digest"
+            echo "attest-save-key=$STEM-${d#sha256:}" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.build.outputs.attest-save-key != ''
+        name: Record attestation
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/ci-toolkit-attest
+          key: ${{ steps.build.outputs.attest-save-key }}
+      - if: steps.build.outputs.built == 'true' && inputs.prune-keep > 0 && inputs.image == '' && inputs.registry == 'ghcr.io'
+        name: Prune old versions
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ steps.args.outputs.owner }}
+          PACKAGE: ${{ steps.args.outputs.package }}
+          KEEP: ${{ inputs.prune-keep }}
+          KEEP_DAYS: ${{ inputs.prune-keep-days }}
+        run: '"$CI_TOOLKIT/scripts/prune-images.sh" --owner "$OWNER" --package "${PACKAGE#*/}" --keep "$KEEP" --keep-days "$KEEP_DAYS"'
       - name: Summary
         shell: bash
+        env:
+          BUILT: ${{ steps.build.outputs.built }}
+          IMAGE: ${{ steps.build.outputs.image }}
         run: |
-          if [ "${{ steps.build.outputs.built }}" = "true" ]; then s="🔨 built"; else s="♻️ reused (no build)"; fi
-          echo "### Image $s" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ steps.build.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BUILT" = "true" ]; then s="🔨 built"; else s="♻️ reused (no build)"; fi
+          { echo "### Image $s"; echo "\`$IMAGE\`"; } >> "$GITHUB_STEP_SUMMARY"

@@ -56,8 +56,9 @@ on:
         type: string
         default: ""
       pass-backend:
+        description: gha (branch-scoped, unforgeable by PRs) | registry
         type: string
-        default: registry
+        default: gha
       cache-paths:
         type: string
         default: ""
@@ -97,6 +98,9 @@ jobs:
         shard: ${{ fromJSON(inputs.shards) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The workspace is mounted into the test container; no token in .git/config.
+          persist-credentials: false
       - name: Fetch ci-toolkit
         shell: bash
         env:
@@ -106,6 +110,10 @@ jobs:
           mkdir -p .ci-toolkit && cd .ci-toolkit
           git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
           echo ".ci-toolkit/" >> "$GITHUB_WORKSPACE/.git/info/exclude"
+          # Registry credentials outside the runner's home (persistent on self-hosted).
+          dc="$RUNNER_TEMP/ci-toolkit-docker"; mkdir -p "$dc"
+          [ -d "$HOME/.docker/cli-plugins" ] && ln -sfn "$HOME/.docker/cli-plugins" "$dc/cli-plugins"
+          echo "DOCKER_CONFIG=$dc" >> "$GITHUB_ENV"
       - id: cmd
         shell: bash
         env:
@@ -113,9 +121,9 @@ jobs:
           SHARDS: ${{ inputs.shards }}
           SHARD: ${{ matrix.shard }}
         run: |
-          total="$(printf '%s' "$SHARDS" | tr -cd ',' | wc -c | tr -d ' ')"; total=$((total + 1))
+          total="$(printf '%s' "$SHARDS" | jq 'length')"
           c="${CMD//\{shard\}/$SHARD}"; c="${c//\{total\}/$total}"
-          printf 'command<<EOF\n%s\nEOF\n' "$c" >> "$GITHUB_OUTPUT"
+          d="CI_TOOLKIT_$RANDOM$RANDOM"; printf 'command<<%s\n%s\n%s\n' "$d" "$c" "$d" >> "$GITHUB_OUTPUT"
           echo "total=$total" >> "$GITHUB_OUTPUT"
       - uses: ./.ci-toolkit/github/actions/run-in-image
         with:

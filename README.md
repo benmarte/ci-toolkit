@@ -10,6 +10,7 @@ changed**, on GitHub Actions today and GitLab CI / Azure DevOps next.
 | No re-runs | `pass-cache.sh` hashes a job's inputs; when those exact inputs already passed, the job exits in seconds. Re-pushes, rebases, docs-only commits and the post-merge push to the default branch stop re-paying for green work. Markers live in the registry, so a pass recorded on a PR is visible to the push that merges it. |
 | No reinstalls | `detect-cache.sh` finds the package managers (go, bun, npm, pnpm, yarn, pip, poetry, uv, cargo) and prints cache paths and a lockfile-derived key. |
 | Build once, run many | `run-tests.sh` runs any command inside the prebuilt image, so unit, integration and e2e jobs share one build. |
+| Storage inside budget | `prune-images.sh` deletes image versions nothing reuses (keep newest N + last D days + protected tags). `docker-build` runs it after every new build, so registry storage stays flat. |
 | Honest bills | `bill-report.sh` prints billed minutes per job and run, including GitHub's round-up-to-the-minute overhead, and what self-hosted jobs would cost hosted. |
 | Parallelism | `shard.sh` splits a suite into N shards (native `--shard=i/N`, or file lists balanced by timings). Sharding buys wall-clock time and **costs** minutes — off by default. |
 
@@ -23,6 +24,7 @@ scripts/                 all real logic — portable bash, no CI-platform variab
   detect-cache.sh        package managers → cache paths + key
   shard.sh               split a run into N shards
   bill-report.sh         billed minutes per job/run (GitHub)
+  prune-images.sh        delete image versions nothing reuses (GHCR)
 .github/workflows/       GitHub reusable workflows (GitHub requires this path)
   docker-build.yml       workflow_call → build-image.sh
   test-in-image.yml      workflow_call → run-in-image action
@@ -99,19 +101,44 @@ Or use the composite actions inside your own jobs:
 
 Notes
 
-- Pass `toolkit-ref` equal to the `@ref` you call a workflow with (default `v1`).
+- Pass `toolkit-ref` equal to the `@ref` you call a workflow with (default
+  `v1`). Pin both to the same commit sha if you need them immutable.
+- A floating `FROM` tag is not part of the image hash. Pin base images by
+  digest, or pass the digest as a build arg, to rebuild when the base moves.
 - `runs-on` takes JSON, so one repo variable can flip jobs between hosted and
   self-hosted: `runs-on: ${{ vars.CI_RUNS_ON || '"ubuntu-latest"' }}`.
 - This repo is public so any org can call it; it holds no secrets. Callers
   pass their own registry credentials (GHCR uses the caller's `GITHUB_TOKEN`).
 - Registry: GHCR by default; any registry via `image:` (ACR, GitLab, ECR…).
 
+### Trust model
+
+Skipping work is only safe if nobody can fake "this already passed".
+
+- **Pass markers** default to the GitHub cache (`pass-backend: gha`). GitHub
+  scopes it per branch: a PR sees its own markers and the default branch's,
+  and nothing a PR writes is visible to the default branch. So PR code cannot
+  plant a marker that makes the default branch skip its tests.
+- **Images** are reused only when the GitHub cache holds an attestation for
+  that tag's exact digest, recorded when this branch scope (or the default
+  branch) built it. A tag overwritten by anyone else is rebuilt, not shipped
+  (the self-test forges one to prove it).
+- **BuildKit layer cache** defaults to the GitHub cache for the same reason,
+  and because it does not count against package storage.
+- Cost of this: the push that merges a PR re-runs work the PR already did,
+  because the default branch cannot see the PR's markers.
+- Remaining assumption: `cache-backend: registry` and `pass-backend: registry`
+  are writable by any job with `packages:write`. Use them only where no
+  branch-scoped cache exists, and never build release images from a cache
+  PRs can write to.
+
 ### Choosing pass-cache inputs
 
-A pass marker is only as honest as its key. Include everything that can
+`run-in-image` already adds the image digest, command, env (pass-through
+values hashed), workdir, user, compose files and services, and the
+toolkit's own scripts. A pass marker is only as honest as its key. Include everything else that can
 change the outcome: the source the job tests, lockfiles, the CI workflow file
 itself, config files (lint rules, tsconfig), and tool versions via `salts`.
-The image ref, command and env are added automatically by `run-in-image`.
 Leave out what cannot matter (docs, other apps in a monorepo) — that is where
 the savings come from. When unsure, include it: a missed skip costs minutes, a
 false skip costs a bug.

@@ -53,8 +53,9 @@ on:
         type: string
         default: ""
       pass-backend:
+        description: gha (branch-scoped, unforgeable by PRs) | registry
         type: string
-        default: registry
+        default: gha
       cache-paths:
         description: Directories inside the container to persist (rolling cache)
         type: string
@@ -104,6 +105,9 @@ jobs:
       skipped: ${{ steps.run.outputs.skipped }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The workspace is mounted into the test container; no token in .git/config.
+          persist-credentials: false
       - name: Fetch ci-toolkit
         shell: bash
         env:
@@ -114,6 +118,10 @@ jobs:
           git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
           # Never part of the caller's hashes or status.
           echo ".ci-toolkit/" >> "$GITHUB_WORKSPACE/.git/info/exclude"
+          # Registry credentials outside the runner's home (persistent on self-hosted).
+          dc="$RUNNER_TEMP/ci-toolkit-docker"; mkdir -p "$dc"
+          [ -d "$HOME/.docker/cli-plugins" ] && ln -sfn "$HOME/.docker/cli-plugins" "$dc/cli-plugins"
+          echo "DOCKER_CONFIG=$dc" >> "$GITHUB_ENV"
       - id: run
         uses: ./.ci-toolkit/github/actions/run-in-image
         with:

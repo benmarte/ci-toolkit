@@ -45,7 +45,7 @@ runs:
         MANAGERS: ${{ inputs.managers }}
         PREFIX: ${{ inputs.prefix }}
       run: |
-        args=(--dir "$DIR" --prefix "$PREFIX" --os "${RUNNER_OS,,}")
+        args=(--dir "$DIR" --prefix "$PREFIX" --os "$(printf '%s' "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')")
         for m in $MANAGERS; do args+=(--manager "$m"); done
         CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/detect-cache.sh" "${args[@]}"
     - id: keys
@@ -58,10 +58,10 @@ runs:
       run: |
         if [ "$ROLLING" = "true" ]; then
           echo "key=$KEY-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          printf 'restore-keys<<EOF\n%s-\n%s\nEOF\n' "$KEY" "$RESTORE" >> "$GITHUB_OUTPUT"
+          d="CI_TOOLKIT_$RANDOM$RANDOM"; printf 'restore-keys<<%s\n%s-\n%s\n%s\n' "$d" "$KEY" "$RESTORE" "$d" >> "$GITHUB_OUTPUT"
         else
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
-          printf 'restore-keys<<EOF\n%s\nEOF\n' "$RESTORE" >> "$GITHUB_OUTPUT"
+          d="CI_TOOLKIT_$RANDOM$RANDOM"; printf 'restore-keys<<%s\n%s\n%s\n' "$d" "$RESTORE" "$d" >> "$GITHUB_OUTPUT"
         fi
     - id: save
       if: steps.detect.outputs.key != '' && inputs.save == 'true'

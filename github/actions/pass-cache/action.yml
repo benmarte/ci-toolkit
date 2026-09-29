@@ -2,9 +2,7 @@ name: ci-toolkit pass-cache
 description: >-
   Skip a job whose exact inputs already passed. mode=check computes the input
   hash and reports hit=true when a pass marker exists; mode=save records the
-  marker after the job succeeded. The default registry backend stores markers
-  as empty images, so a pass recorded on a PR is visible to the push that
-  merges it (the GitHub cache is scoped per branch and would not be).
+  marker after the job succeeded.
 inputs:
   mode:
     description: check | save
@@ -12,9 +10,11 @@ inputs:
   name:
     description: Job name that owns the marker (check)
     required: false
+    default: ""
   paths:
     description: Newline-separated inputs that decide the outcome (check)
     required: false
+    default: ""
   salts:
     description: Newline-separated extra strings that change the outcome, e.g. tool versions (check)
     required: false
@@ -22,24 +22,28 @@ inputs:
   key:
     description: The key printed by mode=check (save)
     required: false
+    default: ""
   backend:
-    description: registry (default, cross-branch) | gha (GitHub cache, same branch + default branch only)
+    description: >-
+      gha (default): GitHub cache, branch-scoped by GitHub — a PR's markers
+      are visible to that PR only, the default branch's to everyone, and no
+      PR can write one the default branch trusts. registry: markers as empty
+      images; visible across branches but forgeable by any job with
+      packages:write. Use it only where no scoped cache exists.
     required: false
-    default: registry
+    default: gha
   ref:
     description: Registry repository for markers (backend=registry). Default ghcr.io/<owner>/<repo>/ci-pass
     required: false
     default: ""
   token:
-    description: >-
-      Registry password/token to log in with (backend=registry), e.g.
-      github.token with packages:write. Omit when the job already ran docker login.
+    description: Registry token (backend=registry), e.g. github.token. Omit when already logged in.
     required: false
     default: ""
 outputs:
   hit:
     description: "'true' when these inputs already passed (check)"
-    value: ${{ steps.check-registry.outputs.hit || (steps.check-gha.outputs.cache-hit == 'true' && 'true') || 'false' }}
+    value: ${{ (steps.check-registry.outputs.hit == 'true' || steps.check-gha.outputs.cache-hit == 'true') && 'true' || 'false' }}
   key:
     description: The marker key
     value: ${{ steps.key.outputs.key || inputs.key }}
@@ -63,7 +67,9 @@ runs:
       shell: bash
       env:
         REF: ${{ inputs.ref }}
-      run: echo "ref=${REF:-ghcr.io/${GITHUB_REPOSITORY,,}/ci-pass}" >> "$GITHUB_OUTPUT"
+      run: |
+        [ -n "$REF" ] || REF="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')/ci-pass"
+        echo "ref=$REF" >> "$GITHUB_OUTPUT"
     - if: inputs.backend == 'registry' && inputs.token != ''
       shell: bash
       env:
@@ -73,29 +79,32 @@ runs:
     - id: check-registry
       if: inputs.mode == 'check' && inputs.backend == 'registry'
       shell: bash
-      run: |
-        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" check \
-          --backend registry --ref "${{ steps.ref.outputs.ref }}" --key "${{ steps.key.outputs.key }}"
+      env:
+        REF: ${{ steps.ref.outputs.ref }}
+        KEY: ${{ steps.key.outputs.key }}
+      run: CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" check --backend registry --ref "$REF" --key "$KEY"
     - id: check-gha
       if: inputs.mode == 'check' && inputs.backend == 'gha'
       uses: actions/cache/restore@v6
       with:
-        path: .ci-toolkit-pass
+        path: ${{ runner.temp }}/ci-toolkit-pass
         key: ${{ steps.key.outputs.key }}
         lookup-only: true
     - if: inputs.mode == 'save' && inputs.backend == 'registry'
       shell: bash
+      env:
+        REF: ${{ steps.ref.outputs.ref }}
+        KEY: ${{ inputs.key }}
       # Best effort: a read-only token (Dependabot) must not fail a green job.
       run: |
-        "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" save \
-          --backend registry --ref "${{ steps.ref.outputs.ref }}" --key "${{ inputs.key }}" \
+        "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" save --backend registry --ref "$REF" --key "$KEY" \
           || echo "::warning::ci-toolkit: could not record the pass marker (read-only token?)"
     - if: inputs.mode == 'save' && inputs.backend == 'gha'
       shell: bash
-      run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
+      run: mkdir -p "$RUNNER_TEMP/ci-toolkit-pass" && date -u > "$RUNNER_TEMP/ci-toolkit-pass/marker"
     - if: inputs.mode == 'save' && inputs.backend == 'gha'
       uses: actions/cache/save@v6
       continue-on-error: true
       with:
-        path: .ci-toolkit-pass
+        path: ${{ runner.temp }}/ci-toolkit-pass
         key: ${{ inputs.key }}

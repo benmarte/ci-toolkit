@@ -18,14 +18,21 @@ sha256() {
 }
 
 # hash_paths [salt...] -- path...
-# Content hash of every file under the given paths. Inside a git work tree
-# only TRACKED files count (their working-tree content, so uncommitted edits
-# do count), so node_modules, build output, caches and anything a CI step
-# drops into the workspace never change the hash; outside git every regular
-# file counts. A new file must be `git add`ed to affect the hash.
-# The hash covers file paths and contents, so a rename changes it too.
-# Missing paths are hashed as "missing:<path>" rather than failing, so a
-# caller can list optional inputs.
+# Content hash of the given paths (names, contents and file modes), plus salts.
+#
+# Inside a git work tree a path hashes to git's own tree/blob id for it,
+# computed from a throw-away copy of the index with the working tree's
+# tracked changes applied (git add -u into a temp index, then write-tree).
+# So: uncommitted edits, deletions, chmod +x and odd file names all count;
+# untracked and ignored files (node_modules, build output, anything a CI step
+# drops in the workspace) do not.
+#
+# Anything git cannot vouch for falls back to hashing every file under the
+# path directly: a path outside git, a path with no tracked files (a
+# gitignored dist/, a generated Dockerfile), or any git error. The fallback
+# only ever includes MORE, so it can cost a cache hit but never cause a
+# false one. Missing paths hash as "missing:<path>" so callers can list
+# optional inputs.
 hash_paths() {
   local salts=() paths=()
   while [ $# -gt 0 ]; do
@@ -34,41 +41,55 @@ hash_paths() {
   done
   [ ${#paths[@]} -gt 0 ] || paths=(.)
   {
-    printf 'ci-toolkit-hash-v1\n'
-    local s
+    printf 'ci-toolkit-hash-v2\n'
+    local s p id
     for s in "${salts[@]+"${salts[@]}"}"; do printf 'salt:%s\n' "$s"; done
-    local p
     for p in "${paths[@]}"; do
-      if [ ! -e "$p" ]; then printf 'missing:%s\n' "$p"; continue; fi
-      if git -C "$(dirname "$p")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        # The index already holds every tracked file's blob hash, so a clean
-        # tree costs one git call however large the repo. Files edited since
-        # the index was written are re-hashed from the working tree in one
-        # batch; deleted ones are dropped.
-        local modified
-        modified="$(git ls-files -m -- "$p")"
-        {
-          git ls-files -s -- "$p" | awk -F'\t' '{ split($1, m, " "); print m[2] " " $2 }'
-          if [ -n "$modified" ]; then
-            printf '%s\n' "$modified" | while IFS= read -r f; do
-              if [ -f "$f" ]; then printf 'M %s\n' "$f"; else printf 'D %s\n' "$f"; fi
-            done
-          fi
-        } | awk -v hashes="$(printf '%s\n' "$modified" | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done | git hash-object --stdin-paths 2>/dev/null | tr '\n' ' ')" '
-          BEGIN { n = split(hashes, h, " ") }
-          $1 == "M" { sub(/^M /, ""); fresh[$0] = h[++i]; next }
-          $1 == "D" { sub(/^D /, ""); gone[$0] = 1; next }
-          { blob = $1; sub(/^[^ ]+ /, ""); order[++k] = $0; idx[$0] = blob }
-          END { for (j = 1; j <= k; j++) { f = order[j]; if (f in gone) continue; print ((f in fresh) ? fresh[f] : idx[f]) " " f } }
-        ' | LC_ALL=C sort -k2
+      if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf 'missing:%s\n' "$p"; continue; fi
+      if id="$(_git_path_id "$p")"; then
+        printf 'git:%s:%s\n' "$p" "$id"
       else
-        find "$p" -type f -print0 2>/dev/null | LC_ALL=C sort -z \
-          | while IFS= read -r -d '' f; do
-              printf '%s %s\n' "$(sha256 < "$f")" "$f"
-            done
+        printf 'files:%s\n' "$p"
+        _hash_files "$p"
       fi
     done
   } | sha256
+}
+
+# _git_path_id PATH — git object id of PATH as it is in the working tree
+# (tracked files only). Fails when PATH is not in a work tree, has no
+# tracked content, or git errors; the caller then hashes files directly.
+_git_path_id() {
+  local p="$1" dir base top prefix rel idx tmp tree id
+  if [ -d "$p" ]; then dir="$p"; base=""; else dir="$(dirname "$p")"; base="$(basename "$p")"; fi
+  top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  prefix="$(git -C "$dir" rev-parse --show-prefix 2>/dev/null)" || return 1
+  rel="${prefix}${base}"; rel="${rel%/}"
+  idx="$(git -C "$top" rev-parse --absolute-git-dir 2>/dev/null)/index" || return 1
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ci-toolkit-index.XXXXXX")" || return 1
+  if [ -f "$idx" ]; then cp "$idx" "$tmp"; else rm -f "$tmp"; fi
+  # add -u stages modifications and deletions of tracked files only.
+  if GIT_INDEX_FILE="$tmp" git -C "$top" add -u -- "${rel:-.}" >/dev/null 2>&1 \
+     && tree="$(GIT_INDEX_FILE="$tmp" git -C "$top" write-tree 2>/dev/null)"; then
+    if [ -z "$rel" ]; then id="$tree"; else id="$(git -C "$top" rev-parse -q --verify "$tree:$rel" 2>/dev/null)" || id=""; fi
+  fi
+  rm -f "$tmp"
+  [ -n "${id:-}" ] || return 1
+  printf '%s' "$id"
+}
+
+# _hash_files PATH — "<sha256> <x|-> <path>" for every file under PATH,
+# sorted. Newline-separated so busybox sort works; the exec bit stands in
+# for the mode since stat(1) flags differ across platforms.
+_hash_files() {
+  local f
+  find "$1" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+    if [ -L "$f" ]; then
+      printf 'link %s %s\n' "$(readlink "$f")" "$f"
+    else
+      printf '%s %s %s\n' "$(sha256 < "$f")" "$([ -x "$f" ] && echo x || echo -)" "$f"
+    fi
+  done
 }
 
 # emit KEY VALUE: write one output as KEY=VALUE to stdout and, when
@@ -90,6 +111,16 @@ emit() {
     fi
   fi
 }
+
+# image_digest REF — the registry digest REF resolves to (sha256:...), or
+# nothing when REF is not in a registry. No pull.
+image_digest() {
+  local raw
+  raw="$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null)" || return 0
+  printf '%s' "$raw" | tr ',' '\n' | sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' | sed -n 1p
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Lower-case, registry-safe slug.
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//'; }

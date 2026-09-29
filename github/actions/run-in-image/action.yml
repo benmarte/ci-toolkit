@@ -13,7 +13,7 @@ inputs:
     description: Shell command to run inside the image
     required: true
   env:
-    description: Newline-separated KEY=VALUE (or KEY to pass through) for the container
+    description: Newline-separated KEY=VALUE (or KEY to pass the job's value through) for the container
     required: false
     default: ""
   workdir:
@@ -37,17 +37,24 @@ inputs:
     required: false
     default: ""
   pass-paths:
-    description: Newline-separated inputs for the pass key (the image ref is always added)
+    description: >-
+      Newline-separated inputs for the pass key. The image digest, command,
+      env (with values), workdir, user, compose files and services are added
+      automatically. Default: the whole repo.
     required: false
     default: ""
   pass-salts:
-    description: Newline-separated extra strings for the pass key
+    description: Newline-separated extra strings for the pass key (tool versions, ...)
     required: false
     default: ""
   pass-backend:
-    description: registry | gha
+    description: >-
+      gha (default): GitHub cache — branch-scoped by GitHub, so a PR cannot
+      plant a marker the default branch trusts. registry: markers as empty
+      images, visible across branches but writable by any job with
+      packages:write; only for platforms without a scoped cache.
     required: false
-    default: registry
+    default: gha
   cache-paths:
     description: >-
       Newline-separated directories INSIDE the container to persist between
@@ -71,7 +78,7 @@ inputs:
     required: false
     default: "3"
   token:
-    description: Registry token for pulling the image and the pass markers (github.token with packages read/write)
+    description: Registry token for pulling the image (and registry-backend markers), e.g. github.token
     required: false
     default: ""
   registry:
@@ -84,6 +91,16 @@ outputs:
 runs:
   using: composite
   steps:
+    # Copy the scripts out of reach first: the test runs with the workspace
+    # mounted read-write, and anything run after it must not be code the
+    # test could have rewritten.
+    - id: tk
+      shell: bash
+      run: |
+        d="$RUNNER_TEMP/ci-toolkit-scripts-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM"
+        cp -R "$GITHUB_ACTION_PATH/../../../scripts" "$d"
+        echo "dir=$d" >> "$GITHUB_OUTPUT"
+
     - if: inputs.token != ''
       shell: bash
       env:
@@ -95,45 +112,68 @@ runs:
       if: inputs.pass-name != ''
       shell: bash
       env:
+        TK: ${{ steps.tk.outputs.dir }}
         NAME: ${{ inputs.pass-name }}
         PATHS: ${{ inputs.pass-paths }}
         SALTS: ${{ inputs.pass-salts }}
         IMAGE: ${{ inputs.image }}
         CMD: ${{ inputs.command }}
         ENVS: ${{ inputs.env }}
+        WORKDIR: ${{ inputs.workdir }}
+        RUN_USER: ${{ inputs.user }}
+        COMPOSE_FILES: ${{ inputs.compose-file }}
+        COMPOSE_SERVICES: ${{ inputs.compose-services }}
       run: |
-        # The image, the command and the env are part of "what was tested".
-        args=(--name "$NAME" --salt "image=$IMAGE" --salt "cmd=$CMD" --salt "env=$ENVS")
+        # shellcheck source=/dev/null
+        . "$TK/lib/common.sh"
+        # Salt by digest, not tag: a moved or forced tag is a different image.
+        digest="$(image_digest "$IMAGE")"
+        [ -n "$digest" ] || digest="unresolved:$IMAGE"
+        args=(--name "$NAME" --salt "image=$digest" --salt "cmd=$CMD" --salt "workdir=$WORKDIR"
+              --salt "user=$RUN_USER" --salt "services=$COMPOSE_SERVICES")
+        # Pass-through env (bare KEY) is salted with its value, hashed.
+        while IFS= read -r e; do
+          [ -n "$e" ] || continue
+          case "$e" in
+            *=*) args+=(--salt "env=$e") ;;
+            *) [[ "$e" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "::error::invalid env name: $e"; exit 1; }
+               args+=(--salt "env=$e=$(printf '%s' "${!e-}" | sha256)") ;;
+          esac
+        done <<< "$ENVS"
         while IFS= read -r p; do [ -n "$p" ] && args+=(--path "$p"); done <<< "$PATHS"
-        while IFS= read -r s; do [ -n "$s" ] && args+=(--salt "$s"); done <<< "$SALTS"
         [ -n "$PATHS" ] || args+=(--path .)
-        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" key "${args[@]}"
+        while IFS= read -r f; do [ -n "$f" ] && args+=(--path "$f"); done <<< "$COMPOSE_FILES"
+        while IFS= read -r s; do [ -n "$s" ] && args+=(--salt "$s"); done <<< "$SALTS"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$TK/pass-cache.sh" key "${args[@]}"
 
-    - id: pass
+    - id: pass-registry
       if: inputs.pass-name != '' && inputs.pass-backend == 'registry'
       shell: bash
+      env:
+        TK: ${{ steps.tk.outputs.dir }}
+        REGISTRY: ${{ inputs.registry }}
+        KEY: ${{ steps.passkey.outputs.key }}
       run: |
-        ref="ghcr.io/${GITHUB_REPOSITORY,,}/ci-pass"
+        ref="$REGISTRY/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')/ci-pass"
         echo "ref=$ref" >> "$GITHUB_OUTPUT"
-        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" check \
-          --backend registry --ref "$ref" --key "${{ steps.passkey.outputs.key }}"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$TK/pass-cache.sh" check --backend registry --ref "$ref" --key "$KEY"
     - id: pass-gha
       if: inputs.pass-name != '' && inputs.pass-backend == 'gha'
       uses: actions/cache/restore@v6
       with:
-        path: .ci-toolkit-pass
+        path: ${{ runner.temp }}/ci-toolkit-pass
         key: ${{ steps.passkey.outputs.key }}
         lookup-only: true
 
     - id: gate
       shell: bash
       env:
-        HIT: ${{ steps.pass.outputs.hit == 'true' || steps.pass-gha.outputs.cache-hit == 'true' }}
+        HIT: ${{ steps.pass-registry.outputs.hit == 'true' || steps.pass-gha.outputs.cache-hit == 'true' }}
+        KEY: ${{ steps.passkey.outputs.key }}
       run: |
         if [ "$HIT" = "true" ]; then
           echo "run=false" >> "$GITHUB_OUTPUT"
-          echo "### ⏭️ Skipped — these exact inputs already passed" >> "$GITHUB_STEP_SUMMARY"
-          echo "key \`${{ steps.passkey.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
+          { echo "### ⏭️ Skipped — these exact inputs already passed"; echo "key \`$KEY\`"; } >> "$GITHUB_STEP_SUMMARY"
         else
           echo "run=true" >> "$GITHUB_OUTPUT"
         fi
@@ -142,21 +182,22 @@ runs:
       if: steps.gate.outputs.run == 'true' && inputs.cache-paths != ''
       shell: bash
       env:
+        TK: ${{ steps.tk.outputs.dir }}
         PATHS: ${{ inputs.cache-paths }}
         STEM: ${{ inputs.cache-key }}
         NAME: ${{ inputs.pass-name }}
       run: |
+        # shellcheck source=/dev/null
+        . "$TK/lib/common.sh"
         base="$RUNNER_TEMP/ci-toolkit-cache"; i=0; vols=""
         while IFS= read -r p; do
           [ -n "$p" ] || continue
           mkdir -p "$base/$i"; vols+="$base/$i:$p"$'\n'; i=$((i + 1))
         done <<< "$PATHS"
-        stem="${STEM:-ci-toolkit-run-${NAME:-$GITHUB_JOB}}"
-        {
-          echo "dir=$base"
-          echo "stem=$stem-${RUNNER_OS,,}"
-          printf 'volumes<<EOF\n%sEOF\n' "$vols"
-        } >> "$GITHUB_OUTPUT"
+        stem="${STEM:-ci-toolkit-run-${NAME:-$GITHUB_JOB}}-$(lower "$RUNNER_OS")"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit dir "$base" >/dev/null
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit stem "$stem" >/dev/null
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit volumes "${vols%$'\n'}" >/dev/null
     - if: steps.cachedirs.outputs.dir != ''
       uses: actions/cache@v6
       with:
@@ -169,24 +210,26 @@ runs:
       if: steps.gate.outputs.run == 'true' && inputs.compose-file != ''
       shell: bash
       env:
+        TK: ${{ steps.tk.outputs.dir }}
         FILES: ${{ inputs.compose-file }}
         SERVICES: ${{ inputs.compose-services }}
       run: |
-        project="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(printf '%s' "$GITHUB_JOB" | tr -c 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"
+        # shellcheck source=/dev/null
+        . "$TK/lib/common.sh"
+        project="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(slug "$GITHUB_JOB")-$RANDOM"
         args=(-p "$project")
         while IFS= read -r f; do [ -n "$f" ] && args+=(-f "$f"); done <<< "$FILES"
-        # shellcheck disable=SC2086
+        # shellcheck disable=SC2086 # SERVICES is a space-separated list
         docker compose "${args[@]}" up -d --wait $SERVICES
-        {
-          echo "project=$project"
-          echo "network=${project}_default"
-          printf 'args<<EOF\n%s\nEOF\n' "${args[*]}"
-        } >> "$GITHUB_OUTPUT"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit project "$project" >/dev/null
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit network "${project}_default" >/dev/null
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" emit files "$FILES" >/dev/null
 
     - id: run
       if: steps.gate.outputs.run == 'true'
       shell: bash
       env:
+        TK: ${{ steps.tk.outputs.dir }}
         IMAGE: ${{ inputs.image }}
         CMD: ${{ inputs.command }}
         ENVS: ${{ inputs.env }}
@@ -200,29 +243,35 @@ runs:
         while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done <<< "$VOLS"
         [ -n "$NETWORK" ] && args+=(--network "$NETWORK")
         [ -n "$RUN_USER" ] && args+=(--user "$RUN_USER")
-        "$GITHUB_ACTION_PATH/../../../scripts/run-tests.sh" "${args[@]}" --cmd "$CMD"
+        "$TK/run-tests.sh" "${args[@]}" --cmd "$CMD"
 
     - if: always() && steps.compose.outputs.project != ''
       shell: bash
       env:
-        ARGS: ${{ steps.compose.outputs.args }}
-      # shellcheck disable=SC2086
-      run: docker compose $ARGS down -v --remove-orphans || true
+        PROJECT: ${{ steps.compose.outputs.project }}
+        FILES: ${{ steps.compose.outputs.files }}
+      run: |
+        args=(-p "$PROJECT")
+        while IFS= read -r f; do [ -n "$f" ] && args+=(-f "$f"); done <<< "$FILES"
+        docker compose "${args[@]}" down -v --remove-orphans || true
 
     - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'registry'
       shell: bash
+      env:
+        TK: ${{ steps.tk.outputs.dir }}
+        REF: ${{ steps.pass-registry.outputs.ref }}
+        KEY: ${{ steps.passkey.outputs.key }}
       run: |
-        "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" save --backend registry \
-          --ref "${{ steps.pass.outputs.ref }}" --key "${{ steps.passkey.outputs.key }}" \
+        "$TK/pass-cache.sh" save --backend registry --ref "$REF" --key "$KEY" \
           || echo "::warning::ci-toolkit: could not record the pass marker (read-only token?)"
     - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'gha'
       shell: bash
-      run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
+      run: mkdir -p "$RUNNER_TEMP/ci-toolkit-pass" && date -u > "$RUNNER_TEMP/ci-toolkit-pass/marker"
     - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'gha'
       uses: actions/cache/save@v6
       continue-on-error: true
       with:
-        path: .ci-toolkit-pass
+        path: ${{ runner.temp }}/ci-toolkit-pass
         key: ${{ steps.passkey.outputs.key }}
 
     - if: always() && steps.gate.outputs.run == 'true' && inputs.artifact-name != ''
