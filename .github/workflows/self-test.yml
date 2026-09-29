@@ -158,3 +158,21 @@ jobs:
           [ "$T2" = "true" ] || { echo "::error::second test was not skipped"; exit 1; }
           echo "build-3 (after forged tag) built=$B3"
           [ "$B3" = "true" ] || { echo "::error::a forged tag was trusted instead of rebuilt"; exit 1; }
+
+  # Real deletion, last, so nothing later needs the pruned versions. Proves a
+  # workflow GITHUB_TOKEN can delete versions its repo published.
+  prune:
+    needs: [assert, prune-dry-run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: prune-images keeps 1, deletes the rest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$(scripts/prune-images.sh --owner "${GITHUB_REPOSITORY_OWNER}" --package ci-toolkit/selftest --keep 1 --keep-days 0 --untagged-hours 0 2>&1)"
+          echo "$out"
+          if echo "$out" | grep -q "could not delete"; then echo "::error::a deletion was refused"; exit 1; fi
