@@ -1,2 +1,4 @@
 .ci-toolkit/
 .ci-toolkit-pass/
+.talos/
+.claude/worktrees/

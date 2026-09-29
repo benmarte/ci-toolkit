@@ -1,0 +1,82 @@
+# Talos pipeline config for benmarte/ci-toolkit.
+#
+# One branch: work lands on `main`; releases are semver tags (vX.Y.Z) plus the
+# moving major tag (v1), cut by hand after a merge — never by the pipeline.
+# Public repo, so the self-test CI on hosted runners costs nothing.
+base_branch: main
+
+vcs:
+  provider: github              # repo auto-detected from the git remote
+
+board:
+  enabled: true
+  project_number: 9             # "ci-toolkit" (benmarte)
+  owner: benmarte
+  status_field: Status
+  statuses:
+    ready: "Ready"
+    in_progress: "In progress"
+    in_review: "In review"
+    done: "Done"
+    blocked: "Blocked"
+
+# Runs once per PR in the developer's worktree before its final commit.
+# shellcheck is pinned to the runner image's version (0.9.0): a newer local
+# shellcheck let two SC2015 findings through that CI then failed on. The
+# integration test's registry port is derived from the issue number so two
+# lanes never collide on the owner's Docker daemon.
+verify:
+  commands:
+    - 'docker run --rm -v "$PWD:/m" -w /m koalaman/shellcheck:v0.9.0 scripts/*.sh scripts/lib/*.sh tests/*.sh'
+    - "bats tests/scripts.bats"
+    - 'REGISTRY_PORT=$((5100 + ${TALOS_ISSUE_NUMBER:-0} % 800)) tests/integration.sh'
+    - "actionlint"
+
+merge:
+  method: squash
+  # self-test.yml: `unit` is shellcheck + bats + integration on the runner;
+  # `assert` proves image reuse, pass skip and forged-tag rebuild end to end.
+  required_checks: ["unit", "assert"]
+  delete_branch: true
+  auto: true
+
+issues:
+  label_filter: "pipeline:ready"
+  skip_labels:
+    - "pipeline:blocked"
+    - "wontfix"
+  max_parallel: 1               # small repo; nearly every change touches scripts/lib/common.sh
+
+roles:
+  validator: true
+  pm: true
+  planner: false
+  qa: true
+  reviewer: true
+  security: true                # public toolkit called by private repos: injection/token handling matter
+  docs: true
+  adversarial: true             # false skips are this repo's worst failure class
+
+comments:
+  enabled: true
+  header: "**Agent:** {role} (talos)"
+
+notifications:
+  slack_channel: ""
+  discord_channel: ""
+
+limits:
+  max_fix_attempts: 3
+
+# Same tiers as RIZQ-TECH/dycotomic-platform (its TRACKER §9 row 39).
+agents:
+  runner: claude
+  subagents: true
+  model: sonnet
+  roles:
+    planner:
+      model: opus
+    adversarial:
+      model: opus
+    security:
+      model: opus
