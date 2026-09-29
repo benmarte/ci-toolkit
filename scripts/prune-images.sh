@@ -99,7 +99,8 @@ for pkg in "${packages[@]}"; do
     fi
     deleted=$((deleted + 1))
   done <<< "$versions"
-  log "$pkg: $deleted version(s) $($dry_run && echo 'would be ' || true)deleted"
+  verb="deleted"; if $dry_run; then verb="would be deleted"; fi
+  log "$pkg: $deleted version(s) $verb"
   total_deleted=$((total_deleted + deleted))
 done
 emit deleted "$total_deleted"
