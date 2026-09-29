@@ -1,0 +1,137 @@
+# Reusable: an end-to-end suite in a prebuilt image, optionally sharded.
+# `{shard}` and `{total}` in the command are replaced per matrix entry, so
+# Playwright/Vitest/Jest take `--shard={shard}/{total}` natively.
+#
+# Sharding buys wall-clock time and COSTS minutes (each shard pays runner
+# start-up, checkout, image pull and service start). shards: '[1]' is the
+# cheapest; add shards only when the suite dwarfs that overhead.
+#
+#   jobs:
+#     e2e:
+#       needs: image
+#       uses: benmarte/ci-toolkit/.github/workflows/e2e.yml@v1
+#       permissions: { contents: read, packages: write }
+#       with:
+#         image: ${{ needs.image.outputs.image }}
+#         command: npx playwright test --shard={shard}/{total}
+#         shards: '[1,2]'        # scripts/shard.sh --matrix 2
+#         compose-file: docker-compose.e2e.yml
+#         artifact-path: playwright-report
+name: e2e
+on:
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        required: true
+      command:
+        type: string
+        required: true
+      shards:
+        description: JSON array of shard indexes, e.g. '[1,2,3]'
+        type: string
+        default: "[1]"
+      env:
+        type: string
+        default: ""
+      workdir:
+        type: string
+        default: /work
+      user:
+        type: string
+        default: ""
+      compose-file:
+        type: string
+        default: ""
+      compose-services:
+        type: string
+        default: ""
+      pass-name:
+        type: string
+        default: ""
+      pass-paths:
+        type: string
+        default: ""
+      pass-salts:
+        type: string
+        default: ""
+      pass-backend:
+        type: string
+        default: registry
+      cache-paths:
+        type: string
+        default: ""
+      artifact-path:
+        type: string
+        default: ""
+      artifact-retention-days:
+        type: number
+        default: 3
+      runs-on:
+        type: string
+        default: '"ubuntu-latest"'
+      timeout-minutes:
+        type: number
+        default: 40
+      toolkit-repo:
+        type: string
+        default: benmarte/ci-toolkit
+      toolkit-ref:
+        type: string
+        default: v1
+    secrets:
+      registry-password:
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  e2e:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch ci-toolkit
+        shell: bash
+        env:
+          REPO: ${{ inputs.toolkit-repo }}
+          REF: ${{ inputs.toolkit-ref }}
+        run: |
+          mkdir -p .ci-toolkit && cd .ci-toolkit
+          git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
+          echo ".ci-toolkit/" >> "$GITHUB_WORKSPACE/.git/info/exclude"
+      - id: cmd
+        shell: bash
+        env:
+          CMD: ${{ inputs.command }}
+          SHARDS: ${{ inputs.shards }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          total="$(printf '%s' "$SHARDS" | tr -cd ',' | wc -c | tr -d ' ')"; total=$((total + 1))
+          c="${CMD//\{shard\}/$SHARD}"; c="${c//\{total\}/$total}"
+          printf 'command<<EOF\n%s\nEOF\n' "$c" >> "$GITHUB_OUTPUT"
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+      - uses: ./.ci-toolkit/github/actions/run-in-image
+        with:
+          image: ${{ inputs.image }}
+          command: ${{ steps.cmd.outputs.command }}
+          env: ${{ inputs.env }}
+          workdir: ${{ inputs.workdir }}
+          user: ${{ inputs.user }}
+          compose-file: ${{ inputs.compose-file }}
+          compose-services: ${{ inputs.compose-services }}
+          pass-name: ${{ inputs.pass-name != '' && format('{0}-{1}of{2}', inputs.pass-name, matrix.shard, steps.cmd.outputs.total) || '' }}
+          pass-paths: ${{ inputs.pass-paths }}
+          pass-salts: ${{ inputs.pass-salts }}
+          pass-backend: ${{ inputs.pass-backend }}
+          cache-paths: ${{ inputs.cache-paths }}
+          artifact-name: ${{ inputs.artifact-path != '' && format('e2e-shard-{0}', matrix.shard) || '' }}
+          artifact-path: ${{ inputs.artifact-path }}
+          artifact-retention-days: ${{ inputs.artifact-retention-days }}
+          token: ${{ secrets.registry-password || github.token }}

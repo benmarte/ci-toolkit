@@ -1,0 +1,136 @@
+# Reusable: run a command inside a prebuilt image, skipping it when its exact
+# inputs already passed. Thin wrapper over github/actions/run-in-image.
+#
+#   jobs:
+#     unit:
+#       needs: image
+#       uses: benmarte/ci-toolkit/.github/workflows/test-in-image.yml@v1
+#       permissions: { contents: read, packages: write }
+#       with:
+#         image: ${{ needs.image.outputs.image }}
+#         command: go test ./...
+#         pass-name: unit
+#         pass-paths: |
+#           go.mod
+#           go.sum
+#           internal
+#           .github/workflows/ci.yml
+name: test-in-image
+on:
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        required: true
+      command:
+        type: string
+        required: true
+      env:
+        description: Newline-separated KEY=VALUE for the container
+        type: string
+        default: ""
+      workdir:
+        type: string
+        default: /work
+      user:
+        type: string
+        default: ""
+      compose-file:
+        description: Compose file(s) for dependencies, newline-separated
+        type: string
+        default: ""
+      compose-services:
+        type: string
+        default: ""
+      pass-name:
+        description: Enable skip-if-already-passed under this name
+        type: string
+        default: ""
+      pass-paths:
+        type: string
+        default: ""
+      pass-salts:
+        type: string
+        default: ""
+      pass-backend:
+        type: string
+        default: registry
+      cache-paths:
+        description: Directories inside the container to persist (rolling cache)
+        type: string
+        default: ""
+      cache-key:
+        type: string
+        default: ""
+      artifact-name:
+        type: string
+        default: ""
+      artifact-path:
+        type: string
+        default: ""
+      artifact-retention-days:
+        type: number
+        default: 3
+      runs-on:
+        type: string
+        default: '"ubuntu-latest"'
+      timeout-minutes:
+        type: number
+        default: 20
+      toolkit-repo:
+        type: string
+        default: benmarte/ci-toolkit
+      toolkit-ref:
+        description: Keep equal to the @ref you call this workflow with
+        type: string
+        default: v1
+    secrets:
+      registry-password:
+        description: Defaults to GITHUB_TOKEN (GHCR)
+        required: false
+    outputs:
+      skipped:
+        value: ${{ jobs.test.outputs.skipped }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      skipped: ${{ steps.run.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch ci-toolkit
+        shell: bash
+        env:
+          REPO: ${{ inputs.toolkit-repo }}
+          REF: ${{ inputs.toolkit-ref }}
+        run: |
+          mkdir -p .ci-toolkit && cd .ci-toolkit
+          git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
+          # Never part of the caller's hashes or status.
+          echo ".ci-toolkit/" >> "$GITHUB_WORKSPACE/.git/info/exclude"
+      - id: run
+        uses: ./.ci-toolkit/github/actions/run-in-image
+        with:
+          image: ${{ inputs.image }}
+          command: ${{ inputs.command }}
+          env: ${{ inputs.env }}
+          workdir: ${{ inputs.workdir }}
+          user: ${{ inputs.user }}
+          compose-file: ${{ inputs.compose-file }}
+          compose-services: ${{ inputs.compose-services }}
+          pass-name: ${{ inputs.pass-name }}
+          pass-paths: ${{ inputs.pass-paths }}
+          pass-salts: ${{ inputs.pass-salts }}
+          pass-backend: ${{ inputs.pass-backend }}
+          cache-paths: ${{ inputs.cache-paths }}
+          cache-key: ${{ inputs.cache-key }}
+          artifact-name: ${{ inputs.artifact-name }}
+          artifact-path: ${{ inputs.artifact-path }}
+          artifact-retention-days: ${{ inputs.artifact-retention-days }}
+          token: ${{ secrets.registry-password || github.token }}

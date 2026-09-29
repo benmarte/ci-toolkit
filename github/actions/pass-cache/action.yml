@@ -1,0 +1,101 @@
+name: ci-toolkit pass-cache
+description: >-
+  Skip a job whose exact inputs already passed. mode=check computes the input
+  hash and reports hit=true when a pass marker exists; mode=save records the
+  marker after the job succeeded. The default registry backend stores markers
+  as empty images, so a pass recorded on a PR is visible to the push that
+  merges it (the GitHub cache is scoped per branch and would not be).
+inputs:
+  mode:
+    description: check | save
+    required: true
+  name:
+    description: Job name that owns the marker (check)
+    required: false
+  paths:
+    description: Newline-separated inputs that decide the outcome (check)
+    required: false
+  salts:
+    description: Newline-separated extra strings that change the outcome, e.g. tool versions (check)
+    required: false
+    default: ""
+  key:
+    description: The key printed by mode=check (save)
+    required: false
+  backend:
+    description: registry (default, cross-branch) | gha (GitHub cache, same branch + default branch only)
+    required: false
+    default: registry
+  ref:
+    description: Registry repository for markers (backend=registry). Default ghcr.io/<owner>/<repo>/ci-pass
+    required: false
+    default: ""
+  token:
+    description: >-
+      Registry password/token to log in with (backend=registry), e.g.
+      github.token with packages:write. Omit when the job already ran docker login.
+    required: false
+    default: ""
+outputs:
+  hit:
+    description: "'true' when these inputs already passed (check)"
+    value: ${{ steps.check-registry.outputs.hit || (steps.check-gha.outputs.cache-hit == 'true' && 'true') || 'false' }}
+  key:
+    description: The marker key
+    value: ${{ steps.key.outputs.key || inputs.key }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      if: inputs.mode == 'check'
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        PATHS: ${{ inputs.paths }}
+        SALTS: ${{ inputs.salts }}
+      run: |
+        args=(--name "$NAME")
+        while IFS= read -r p; do [ -n "$p" ] && args+=(--path "$p"); done <<< "$PATHS"
+        while IFS= read -r s; do [ -n "$s" ] && args+=(--salt "$s"); done <<< "$SALTS"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" key "${args[@]}"
+    - id: ref
+      if: inputs.backend == 'registry'
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+      run: echo "ref=${REF:-ghcr.io/${GITHUB_REPOSITORY,,}/ci-pass}" >> "$GITHUB_OUTPUT"
+    - if: inputs.backend == 'registry' && inputs.token != ''
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        REF: ${{ steps.ref.outputs.ref }}
+      run: printf '%s' "$TOKEN" | docker login "${REF%%/*}" -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+    - id: check-registry
+      if: inputs.mode == 'check' && inputs.backend == 'registry'
+      shell: bash
+      run: |
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" check \
+          --backend registry --ref "${{ steps.ref.outputs.ref }}" --key "${{ steps.key.outputs.key }}"
+    - id: check-gha
+      if: inputs.mode == 'check' && inputs.backend == 'gha'
+      uses: actions/cache/restore@v4
+      with:
+        path: .ci-toolkit-pass
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: true
+    - if: inputs.mode == 'save' && inputs.backend == 'registry'
+      shell: bash
+      # Best effort: a read-only token (Dependabot) must not fail a green job.
+      run: |
+        "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" save \
+          --backend registry --ref "${{ steps.ref.outputs.ref }}" --key "${{ inputs.key }}" \
+          || echo "::warning::ci-toolkit: could not record the pass marker (read-only token?)"
+    - if: inputs.mode == 'save' && inputs.backend == 'gha'
+      shell: bash
+      run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
+    - if: inputs.mode == 'save' && inputs.backend == 'gha'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: .ci-toolkit-pass
+        key: ${{ inputs.key }}

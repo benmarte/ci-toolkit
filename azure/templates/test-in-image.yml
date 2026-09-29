@@ -1,0 +1,35 @@
+# STUB — Azure DevOps step template for ci-toolkit's run-tests.sh with the
+# pass-cache skip. See docker-build.yml for how to reference the repo.
+parameters:
+  - name: image
+    type: string
+  - name: command
+    type: string
+  - name: passName
+    type: string
+    default: ""
+  - name: passPaths
+    type: object
+    default: ["."]
+  - name: passRef
+    type: string
+    default: ""   # e.g. myacr.azurecr.io/team/ci-pass
+
+steps:
+  - bash: |
+      set -euo pipefail
+      CT="$(Pipeline.Workspace)/s/ci-toolkit/scripts"
+      if [ -n "${{ parameters.passName }}" ]; then
+        pargs=(--name "${{ parameters.passName }}" --salt "image=${{ parameters.image }}")
+        ${{ each p in parameters.passPaths }}:
+        pargs+=(--path "${{ p }}")
+        key="$(bash "$CT/pass-cache.sh" key "${pargs[@]}" | sed -n 's/^key=//p')"
+        if [ "$(bash "$CT/pass-cache.sh" check --backend registry --ref "${{ parameters.passRef }}" --key "$key" | sed -n 's/^hit=//p')" = true ]; then
+          echo "skipped: inputs already passed ($key)"; exit 0
+        fi
+      fi
+      bash "$CT/run-tests.sh" --image "${{ parameters.image }}" --cmd "${{ parameters.command }}"
+      if [ -n "${{ parameters.passName }}" ]; then
+        bash "$CT/pass-cache.sh" save --backend registry --ref "${{ parameters.passRef }}" --key "$key"
+      fi
+    displayName: ci-toolkit test-in-image

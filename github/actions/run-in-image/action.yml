@@ -1,0 +1,234 @@
+name: ci-toolkit run-in-image
+description: >-
+  Run a test command inside a prebuilt image: skip it when its inputs already
+  passed, restore caches into the container, bring up compose dependencies,
+  run, record the pass, and upload a short-lived artifact. The step both
+  reusable workflows (test-in-image, e2e) are built from; usable directly in
+  a caller's own job too.
+inputs:
+  image:
+    description: Image to run (e.g. the docker-build workflow's `image` output)
+    required: true
+  command:
+    description: Shell command to run inside the image
+    required: true
+  env:
+    description: Newline-separated KEY=VALUE (or KEY to pass through) for the container
+    required: false
+    default: ""
+  workdir:
+    description: Working directory in the container (the workspace is mounted there)
+    required: false
+    default: /work
+  user:
+    description: Container user; "host" runs as the runner's uid:gid so written files stay removable
+    required: false
+    default: ""
+  compose-file:
+    description: Compose file(s) (newline-separated) for dependencies such as postgres. Empty = none.
+    required: false
+    default: ""
+  compose-services:
+    description: Space-separated services to start (default all in the file)
+    required: false
+    default: ""
+  pass-name:
+    description: Enable pass-cache under this name. Empty = always run.
+    required: false
+    default: ""
+  pass-paths:
+    description: Newline-separated inputs for the pass key (the image ref is always added)
+    required: false
+    default: ""
+  pass-salts:
+    description: Newline-separated extra strings for the pass key
+    required: false
+    default: ""
+  pass-backend:
+    description: registry | gha
+    required: false
+    default: registry
+  cache-paths:
+    description: >-
+      Newline-separated directories INSIDE the container to persist between
+      runs (e.g. /root/.cache/go-build). Each is mounted from a runner dir
+      restored with actions/cache and saved as a rolling cache.
+    required: false
+    default: ""
+  cache-key:
+    description: Key stem for cache-paths (default ci-toolkit-run-<pass-name|job>)
+    required: false
+    default: ""
+  artifact-name:
+    description: Upload this artifact when set
+    required: false
+    default: ""
+  artifact-path:
+    description: Path(s) to upload (relative to the workspace)
+    required: false
+    default: ""
+  artifact-retention-days:
+    required: false
+    default: "3"
+  token:
+    description: Registry token for pulling the image and the pass markers (github.token with packages read/write)
+    required: false
+    default: ""
+  registry:
+    required: false
+    default: ghcr.io
+outputs:
+  skipped:
+    description: "'true' when the inputs had already passed and nothing ran"
+    value: ${{ steps.gate.outputs.run == 'false' && 'true' || 'false' }}
+runs:
+  using: composite
+  steps:
+    - if: inputs.token != ''
+      shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
+        REGISTRY: ${{ inputs.registry }}
+      run: printf '%s' "$TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+
+    - id: passkey
+      if: inputs.pass-name != ''
+      shell: bash
+      env:
+        NAME: ${{ inputs.pass-name }}
+        PATHS: ${{ inputs.pass-paths }}
+        SALTS: ${{ inputs.pass-salts }}
+        IMAGE: ${{ inputs.image }}
+        CMD: ${{ inputs.command }}
+        ENVS: ${{ inputs.env }}
+      run: |
+        # The image, the command and the env are part of "what was tested".
+        args=(--name "$NAME" --salt "image=$IMAGE" --salt "cmd=$CMD" --salt "env=$ENVS")
+        while IFS= read -r p; do [ -n "$p" ] && args+=(--path "$p"); done <<< "$PATHS"
+        while IFS= read -r s; do [ -n "$s" ] && args+=(--salt "$s"); done <<< "$SALTS"
+        [ -n "$PATHS" ] || args+=(--path .)
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" key "${args[@]}"
+
+    - id: pass
+      if: inputs.pass-name != '' && inputs.pass-backend == 'registry'
+      shell: bash
+      run: |
+        ref="ghcr.io/${GITHUB_REPOSITORY,,}/ci-pass"
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" check \
+          --backend registry --ref "$ref" --key "${{ steps.passkey.outputs.key }}"
+    - id: pass-gha
+      if: inputs.pass-name != '' && inputs.pass-backend == 'gha'
+      uses: actions/cache/restore@v4
+      with:
+        path: .ci-toolkit-pass
+        key: ${{ steps.passkey.outputs.key }}
+        lookup-only: true
+
+    - id: gate
+      shell: bash
+      env:
+        HIT: ${{ steps.pass.outputs.hit == 'true' || steps.pass-gha.outputs.cache-hit == 'true' }}
+      run: |
+        if [ "$HIT" = "true" ]; then
+          echo "run=false" >> "$GITHUB_OUTPUT"
+          echo "### ⏭️ Skipped — these exact inputs already passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "key \`${{ steps.passkey.outputs.key }}\`" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "run=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: cachedirs
+      if: steps.gate.outputs.run == 'true' && inputs.cache-paths != ''
+      shell: bash
+      env:
+        PATHS: ${{ inputs.cache-paths }}
+        STEM: ${{ inputs.cache-key }}
+        NAME: ${{ inputs.pass-name }}
+      run: |
+        base="$RUNNER_TEMP/ci-toolkit-cache"; i=0; vols=""
+        while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          mkdir -p "$base/$i"; vols+="$base/$i:$p"$'\n'; i=$((i + 1))
+        done <<< "$PATHS"
+        stem="${STEM:-ci-toolkit-run-${NAME:-$GITHUB_JOB}}"
+        {
+          echo "dir=$base"
+          echo "stem=$stem-${RUNNER_OS,,}"
+          printf 'volumes<<EOF\n%sEOF\n' "$vols"
+        } >> "$GITHUB_OUTPUT"
+    - if: steps.cachedirs.outputs.dir != ''
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.cachedirs.outputs.dir }}
+        # Rolling: build/test caches change without the lockfile changing.
+        key: ${{ steps.cachedirs.outputs.stem }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.cachedirs.outputs.stem }}-
+
+    - id: compose
+      if: steps.gate.outputs.run == 'true' && inputs.compose-file != ''
+      shell: bash
+      env:
+        FILES: ${{ inputs.compose-file }}
+        SERVICES: ${{ inputs.compose-services }}
+      run: |
+        project="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(printf '%s' "$GITHUB_JOB" | tr -c 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]')"
+        args=(-p "$project")
+        while IFS= read -r f; do [ -n "$f" ] && args+=(-f "$f"); done <<< "$FILES"
+        # shellcheck disable=SC2086
+        docker compose "${args[@]}" up -d --wait $SERVICES
+        {
+          echo "project=$project"
+          echo "network=${project}_default"
+          printf 'args<<EOF\n%s\nEOF\n' "${args[*]}"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: run
+      if: steps.gate.outputs.run == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        CMD: ${{ inputs.command }}
+        ENVS: ${{ inputs.env }}
+        VOLS: ${{ steps.cachedirs.outputs.volumes }}
+        NETWORK: ${{ steps.compose.outputs.network }}
+        WORKDIR: ${{ inputs.workdir }}
+        RUN_USER: ${{ inputs.user }}
+      run: |
+        args=(--image "$IMAGE" --workdir "$WORKDIR")
+        while IFS= read -r e; do [ -n "$e" ] && args+=(--env "$e"); done <<< "$ENVS"
+        while IFS= read -r v; do [ -n "$v" ] && args+=(--volume "$v"); done <<< "$VOLS"
+        [ -n "$NETWORK" ] && args+=(--network "$NETWORK")
+        [ -n "$RUN_USER" ] && args+=(--user "$RUN_USER")
+        "$GITHUB_ACTION_PATH/../../../scripts/run-tests.sh" "${args[@]}" --cmd "$CMD"
+
+    - if: always() && steps.compose.outputs.project != ''
+      shell: bash
+      env:
+        ARGS: ${{ steps.compose.outputs.args }}
+      # shellcheck disable=SC2086
+      run: docker compose $ARGS down -v --remove-orphans || true
+
+    - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'registry'
+      shell: bash
+      run: |
+        "$GITHUB_ACTION_PATH/../../../scripts/pass-cache.sh" save --backend registry \
+          --ref "${{ steps.pass.outputs.ref }}" --key "${{ steps.passkey.outputs.key }}" \
+          || echo "::warning::ci-toolkit: could not record the pass marker (read-only token?)"
+    - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'gha'
+      shell: bash
+      run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
+    - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'gha'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: .ci-toolkit-pass
+        key: ${{ steps.passkey.outputs.key }}
+
+    - if: always() && steps.gate.outputs.run == 'true' && inputs.artifact-name != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.artifact-path }}
+        retention-days: ${{ inputs.artifact-retention-days }}
+        if-no-files-found: ignore

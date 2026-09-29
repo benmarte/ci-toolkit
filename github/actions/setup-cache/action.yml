@@ -1,0 +1,79 @@
+name: ci-toolkit setup-cache
+description: >-
+  Detect the repo's package managers and restore (then save) their caches
+  with actions/cache. rolling=true saves a fresh cache every run and restores
+  the newest by prefix — use it for build/test caches whose contents change
+  without the lockfile changing (Go's GOCACHE, which also holds test results).
+inputs:
+  dir:
+    description: Repo root to inspect
+    required: false
+    default: .
+  managers:
+    description: Space-separated managers to restrict to (go bun npm pnpm yarn pip poetry uv cargo). Default all detected.
+    required: false
+    default: ""
+  prefix:
+    description: Cache key prefix. Use a distinct prefix per job when jobs need different caches.
+    required: false
+    default: ci-toolkit
+  rolling:
+    description: "'true' to save a new cache every run (key suffixed with the run id)"
+    required: false
+    default: "false"
+  save:
+    description: "'false' to restore only (e.g. on pull requests, to keep the cache budget for the default branch)"
+    required: false
+    default: "true"
+outputs:
+  cache-hit:
+    description: "'true' on an exact key match"
+    value: ${{ steps.save.outputs.cache-hit || steps.restore.outputs.cache-hit }}
+  managers:
+    value: ${{ steps.detect.outputs.managers }}
+  key:
+    value: ${{ steps.keys.outputs.key }}
+  paths:
+    value: ${{ steps.detect.outputs.paths }}
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        MANAGERS: ${{ inputs.managers }}
+        PREFIX: ${{ inputs.prefix }}
+      run: |
+        args=(--dir "$DIR" --prefix "$PREFIX" --os "${RUNNER_OS,,}")
+        for m in $MANAGERS; do args+=(--manager "$m"); done
+        CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$GITHUB_ACTION_PATH/../../../scripts/detect-cache.sh" "${args[@]}"
+    - id: keys
+      if: steps.detect.outputs.key != ''
+      shell: bash
+      env:
+        KEY: ${{ steps.detect.outputs.key }}
+        RESTORE: ${{ steps.detect.outputs.restore-keys }}
+        ROLLING: ${{ inputs.rolling }}
+      run: |
+        if [ "$ROLLING" = "true" ]; then
+          echo "key=$KEY-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          printf 'restore-keys<<EOF\n%s-\n%s\nEOF\n' "$KEY" "$RESTORE" >> "$GITHUB_OUTPUT"
+        else
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          printf 'restore-keys<<EOF\n%s\nEOF\n' "$RESTORE" >> "$GITHUB_OUTPUT"
+        fi
+    - id: save
+      if: steps.detect.outputs.key != '' && inputs.save == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.detect.outputs.paths }}
+        key: ${{ steps.keys.outputs.key }}
+        restore-keys: ${{ steps.keys.outputs.restore-keys }}
+    - id: restore
+      if: steps.detect.outputs.key != '' && inputs.save != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.detect.outputs.paths }}
+        key: ${{ steps.keys.outputs.key }}
+        restore-keys: ${{ steps.keys.outputs.restore-keys }}

@@ -1,0 +1,148 @@
+# Reusable: build an image once per set of inputs and push it.
+# Thin wrapper over scripts/build-image.sh — see that file for semantics.
+#
+#   jobs:
+#     image:
+#       uses: benmarte/ci-toolkit/.github/workflows/docker-build.yml@v1
+#       permissions: { contents: read, packages: write }
+#       with:
+#         name: api-test
+#         file: docker/Dockerfile.dev
+#         hash-paths: |
+#           docker/Dockerfile.dev
+#           go.mod
+#           go.sum
+name: docker-build
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Image name under the registry namespace (ghcr.io/<owner>/<repo>/<name>)
+        type: string
+        default: app
+      image:
+        description: Full image repository, overriding registry+name (e.g. myacr.azurecr.io/team/app)
+        type: string
+        default: ""
+      registry:
+        type: string
+        default: ghcr.io
+      file:
+        type: string
+        default: Dockerfile
+      context:
+        type: string
+        default: .
+      target:
+        type: string
+        default: ""
+      hash-paths:
+        description: Newline-separated inputs that change the image (default the whole context)
+        type: string
+        default: ""
+      build-args:
+        description: Newline-separated KEY=VALUE
+        type: string
+        default: ""
+      platforms:
+        type: string
+        default: linux/amd64
+      extra-tags:
+        description: Newline-separated additional tags (e.g. the commit sha)
+        type: string
+        default: ""
+      cache-backend:
+        description: registry | gha | none
+        type: string
+        default: registry
+      runs-on:
+        description: JSON for runs-on, e.g. '"ubuntu-latest"' or '["self-hosted","linux"]'
+        type: string
+        default: '"ubuntu-latest"'
+      timeout-minutes:
+        type: number
+        default: 30
+      toolkit-repo:
+        type: string
+        default: benmarte/ci-toolkit
+      toolkit-ref:
+        description: Keep equal to the @ref you call this workflow with
+        type: string
+        default: v1
+    secrets:
+      registry-username:
+        required: false
+      registry-password:
+        description: Defaults to GITHUB_TOKEN (GHCR)
+        required: false
+    outputs:
+      image:
+        description: The content-addressed image ref (registry/repo:in-<hash>)
+        value: ${{ jobs.build.outputs.image }}
+      built:
+        description: "'false' when the image already existed and nothing was built"
+        value: ${{ jobs.build.outputs.built }}
+      hash:
+        value: ${{ jobs.build.outputs.hash }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+      built: ${{ steps.build.outputs.built }}
+      hash: ${{ steps.build.outputs.hash }}
+    steps:
+      - uses: actions/checkout@v4
+      # Cloned outside the workspace so it can never enter the build context.
+      - name: Fetch ci-toolkit
+        shell: bash
+        env:
+          REPO: ${{ inputs.toolkit-repo }}
+          REF: ${{ inputs.toolkit-ref }}
+        run: |
+          d="$RUNNER_TEMP/ci-toolkit"; mkdir -p "$d"; cd "$d"
+          git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
+          echo "CI_TOOLKIT=$d" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Registry login
+        shell: bash
+        env:
+          REGISTRY: ${{ inputs.image != '' && inputs.image || inputs.registry }}
+          USERNAME: ${{ secrets.registry-username || github.actor }}
+          PASSWORD: ${{ secrets.registry-password || github.token }}
+        run: printf '%s' "$PASSWORD" | docker login "${REGISTRY%%/*}" -u "$USERNAME" --password-stdin >/dev/null
+      - id: build
+        name: Build (or reuse) image
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          REGISTRY: ${{ inputs.registry }}
+          NAME: ${{ inputs.name }}
+          FILE: ${{ inputs.file }}
+          CONTEXT: ${{ inputs.context }}
+          TARGET: ${{ inputs.target }}
+          HASH_PATHS: ${{ inputs.hash-paths }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          PLATFORMS: ${{ inputs.platforms }}
+          EXTRA_TAGS: ${{ inputs.extra-tags }}
+          CACHE_BACKEND: ${{ inputs.cache-backend }}
+        run: |
+          image="${IMAGE:-$REGISTRY/${GITHUB_REPOSITORY,,}/$NAME}"
+          args=(--image "$image" --file "$FILE" --context "$CONTEXT" --platform "$PLATFORMS" --cache-backend "$CACHE_BACKEND")
+          [ -n "$TARGET" ] && args+=(--target "$TARGET")
+          while IFS= read -r p; do [ -n "$p" ] && args+=(--hash-path "$p"); done <<< "$HASH_PATHS"
+          while IFS= read -r a; do [ -n "$a" ] && args+=(--build-arg "$a"); done <<< "$BUILD_ARGS"
+          while IFS= read -r t; do [ -n "$t" ] && args+=(--extra-tag "$t"); done <<< "$EXTRA_TAGS"
+          CI_TOOLKIT_OUTPUT="$GITHUB_OUTPUT" "$CI_TOOLKIT/scripts/build-image.sh" "${args[@]}"
+      - name: Summary
+        shell: bash
+        run: |
+          if [ "${{ steps.build.outputs.built }}" = "true" ]; then s="🔨 built"; else s="♻️ reused (no build)"; fi
+          echo "### Image $s" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ steps.build.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"

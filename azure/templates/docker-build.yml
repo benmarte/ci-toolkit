@@ -1,0 +1,52 @@
+# STUB — Azure DevOps step template for ci-toolkit's build-image.sh. Not yet
+# exercised on a real Azure pipeline; `ci-onboard` finishes and tests it on
+# first use, then tags a new toolkit release.
+#
+# Consume from azure-pipelines.yml:
+#
+#   resources:
+#     repositories:
+#       - repository: citoolkit
+#         type: github
+#         name: benmarte/ci-toolkit
+#         ref: refs/tags/v1
+#         endpoint: github   # a GitHub service connection
+#   steps:
+#     - checkout: self
+#     - checkout: citoolkit
+#     - template: azure/templates/docker-build.yml@citoolkit
+#       parameters:
+#         image: myacr.azurecr.io/team/app
+#         file: Dockerfile
+#         hashPaths: [src, go.mod, go.sum]
+parameters:
+  - name: image
+    type: string
+  - name: file
+    type: string
+    default: Dockerfile
+  - name: context
+    type: string
+    default: .
+  - name: hashPaths
+    type: object
+    default: []
+  - name: dockerRegistryServiceConnection
+    type: string
+    default: ""
+
+steps:
+  - ${{ if ne(parameters.dockerRegistryServiceConnection, '') }}:
+      - task: Docker@2
+        inputs:
+          command: login
+          containerRegistry: ${{ parameters.dockerRegistryServiceConnection }}
+  - bash: |
+      args=(--image "${{ parameters.image }}" --file "${{ parameters.file }}" --context "${{ parameters.context }}")
+      ${{ each p in parameters.hashPaths }}:
+      args+=(--hash-path "${{ p }}")
+      out="$(bash "$(Pipeline.Workspace)/s/ci-toolkit/scripts/build-image.sh" "${args[@]}")"
+      echo "$out"
+      echo "##vso[task.setvariable variable=image;isOutput=true]$(printf '%s\n' "$out" | sed -n 's/^image=//p')"
+    name: citoolkit_build
+    displayName: ci-toolkit build-image

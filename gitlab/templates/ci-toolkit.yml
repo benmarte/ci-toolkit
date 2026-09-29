@@ -1,0 +1,76 @@
+# STUB — GitLab CI wrapper for ci-toolkit. Not yet exercised on a real GitLab
+# project; `ci-onboard` finishes and tests it the first time a GitLab repo is
+# onboarded, then tags a new toolkit release.
+#
+# Consume from a project's .gitlab-ci.yml:
+#
+#   include:
+#     - remote: https://raw.githubusercontent.com/benmarte/ci-toolkit/v1/gitlab/templates/ci-toolkit.yml
+#
+#   build-image:
+#     extends: .ci-toolkit-build-image
+#     variables:
+#       CT_IMAGE: $CI_REGISTRY_IMAGE/app
+#       CT_FILE: Dockerfile
+#       CT_HASH_PATHS: "src go.mod go.sum"
+#
+#   unit:
+#     extends: .ci-toolkit-test-in-image
+#     needs: [build-image]
+#     variables:
+#       CT_COMMAND: go test ./...
+#       CT_PASS_NAME: unit
+#       CT_PASS_PATHS: "src go.mod go.sum .gitlab-ci.yml"
+#
+# All logic lives in scripts/; these jobs only map CI variables to flags.
+
+variables:
+  CT_TOOLKIT_REPO: https://github.com/benmarte/ci-toolkit
+  CT_TOOLKIT_REF: v1
+
+.ci-toolkit-fetch: &ci-toolkit-fetch
+  - git clone -q --depth 1 --branch "$CT_TOOLKIT_REF" "$CT_TOOLKIT_REPO" "$CI_BUILDS_DIR/.ci-toolkit"
+  - export CT="$CI_BUILDS_DIR/.ci-toolkit/scripts"
+  - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+
+.ci-toolkit-build-image:
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    CT_FILE: Dockerfile
+    CT_CONTEXT: .
+    CT_HASH_PATHS: ""
+  before_script:
+    - apk add -q --no-progress bash git
+    - *ci-toolkit-fetch
+  script:
+    - |
+      args="--image $CT_IMAGE --file $CT_FILE --context $CT_CONTEXT"
+      for p in $CT_HASH_PATHS; do args="$args --hash-path $p"; done
+      CI_TOOLKIT_OUTPUT=build.env bash "$CT/build-image.sh" $args
+  artifacts:
+    reports:
+      dotenv: build.env   # exposes $image to later jobs
+    expire_in: 1 day
+
+.ci-toolkit-test-in-image:
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    CT_PASS_NAME: ""
+    CT_PASS_PATHS: .
+  before_script:
+    - apk add -q --no-progress bash git
+    - *ci-toolkit-fetch
+  script:
+    - |
+      if [ -n "$CT_PASS_NAME" ]; then
+        pargs="--name $CT_PASS_NAME --salt image=$image"
+        for p in $CT_PASS_PATHS; do pargs="$pargs --path $p"; done
+        key=$(bash "$CT/pass-cache.sh" key $pargs | sed -n 's/^key=//p')
+        if [ "$(bash "$CT/pass-cache.sh" check --backend registry --ref "$CI_REGISTRY_IMAGE/ci-pass" --key "$key" | sed -n 's/^hit=//p')" = true ]; then
+          echo "skipped: inputs already passed ($key)"; exit 0
+        fi
+      fi
+    - bash "$CT/run-tests.sh" --image "$image" --cmd "$CT_COMMAND"
+    - if [ -n "$CT_PASS_NAME" ]; then bash "$CT/pass-cache.sh" save --backend registry --ref "$CI_REGISTRY_IMAGE/ci-pass" --key "$key"; fi
