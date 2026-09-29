@@ -81,16 +81,19 @@ _git_path_id() {
 # _hash_files PATH — "<sha256> <x|-> <path>" for every file under PATH,
 # sorted. Newline-separated so busybox sort works; the exec bit stands in
 # for the mode since stat(1) flags differ across platforms.
-_hash_files() {
-  local f
-  find "$1" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+_hash_files() ( # subshell: the cd below must not leak to the caller
+  f="" root="$1"
+  # Paths are recorded relative to the hashed path, so the same content at
+  # another location (a temp copy, another checkout dir) hashes the same.
+  if [ -d "$root" ]; then cd "$root" || return 1; root="."; fi
+  find "$root" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
     if [ -L "$f" ]; then
       printf 'link %s %s\n' "$(readlink "$f")" "$f"
     else
       printf '%s %s %s\n' "$(sha256 < "$f")" "$([ -x "$f" ] && echo x || echo -)" "$f"
     fi
   done
-}
+)
 
 # emit KEY VALUE: write one output as KEY=VALUE to stdout and, when
 # CI_TOOLKIT_OUTPUT names a file, append it there too. That file format
@@ -115,9 +118,9 @@ emit() {
 # image_digest REF — the registry digest REF resolves to (sha256:...), or
 # nothing when REF is not in a registry. No pull.
 image_digest() {
-  local raw
-  raw="$(docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null)" || return 0
-  printf '%s' "$raw" | tr ',' '\n' | sed -n 's/.*"digest":"\(sha256:[0-9a-f]*\)".*/\1/p' | sed -n 1p
+  local d
+  d="$(docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2>/dev/null)" || return 0
+  case "$d" in sha256:*) printf '%s' "$d" ;; esac
 }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }

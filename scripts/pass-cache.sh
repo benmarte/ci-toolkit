@@ -50,7 +50,9 @@ case "$sub" in
     [ ${#paths[@]} -gt 0 ] || die "at least one --path is required" 2
     # The toolkit's own scripts are an input too: a fixed bug here must not
     # leave markers recorded by the buggy version in force.
-    self="$(hash_paths -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
+    # Hashed as plain files (never via git) so a git checkout, a release
+    # tarball and a temp copy of the same scripts give the same key.
+    self="$(_hash_files "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" | sha256)"
     h="$(hash_paths "toolkit=$CI_TOOLKIT_VERSION" "toolkit-scripts=$self" "name=$name" "${salts[@]+"${salts[@]}"}" -- "${paths[@]}")"
     emit key "pass-$(slug "$name")-${h:0:24}"
     ;;

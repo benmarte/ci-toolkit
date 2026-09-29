@@ -22,7 +22,7 @@ case "$1 $2 $3" in
   "buildx imagetools inspect")
     for r in $FAKE_EXISTING; do
       if [ "$r" = "$4" ]; then
-        [ "$5" = "--format" ] && printf '{"mediaType":"x","digest":"%s","size":1}\n' "${FAKE_DIGEST:-sha256:aaaa}"
+        [ "$5" = "--format" ] && printf '%s\n' "${FAKE_DIGEST:-sha256:aaaa}"
         exit 0
       fi
     done; exit 1 ;;
@@ -314,4 +314,23 @@ h() { bash -c '. "$1/lib/common.sh"; shift; hash_paths -- "$@"' _ "$S" "$@"; }
   echo '# edit' >> "$WORK/tk/run-tests.sh"
   k2="$("$WORK/tk/pass-cache.sh" key --name unit --path src | sed -n 's/^key=//p')"
   [ "$k1" != "$k2" ]
+}
+
+@test "the file-hash fallback is location-independent and keeps cwd" {
+  mkdir -p "$WORK/a/x" "$WORK/b/x"; echo same > "$WORK/a/x/f"; echo same > "$WORK/b/x/f"
+  a="$(cd "$WORK/a" && bash -c '. "$1/lib/common.sh"; hash_paths -- x' _ "$S")"
+  b="$(cd "$WORK/b" && bash -c '. "$1/lib/common.sh"; hash_paths -- x' _ "$S")"
+  [ "$a" = "$b" ]
+  # two relative non-git paths in one call: the second must still resolve
+  c="$(cd "$WORK/a" && bash -c '. "$1/lib/common.sh"; hash_paths -- x x' _ "$S")"
+  echo diff > "$WORK/a/x/f"
+  d="$(cd "$WORK/a" && bash -c '. "$1/lib/common.sh"; hash_paths -- x x' _ "$S")"
+  [ "$c" != "$d" ]
+}
+
+@test "pass-cache keys are the same for a copy of the toolkit elsewhere" {
+  k1="$("$S/pass-cache.sh" key --name unit --path src | sed -n 's/^key=//p')"
+  cp -R "$ROOT/scripts" "$WORK/tk-copy-$$"
+  k2="$("$WORK/tk-copy-$$/pass-cache.sh" key --name unit --path src | sed -n 's/^key=//p')"
+  [ "$k1" = "$k2" ]
 }
