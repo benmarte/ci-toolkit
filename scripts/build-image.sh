@@ -109,7 +109,9 @@ fi
 
 # buildx needs a docker-container builder for registry/gha cache export; the
 # default "docker" driver cannot export cache. Reuse ours if it exists.
-driver="$(docker buildx inspect 2>/dev/null | awk '/^Driver:/{print $2; exit}')"
+# Read the whole output (no early exit): stopping the pipe early can SIGPIPE
+# docker, and pipefail would then abort the script.
+driver="$(docker buildx inspect 2>/dev/null | awk '/^Driver:/ && !d { d = $2 } END { print d }' || true)"
 if [ "$cache_backend" != "none" ] && [ "$driver" = "docker" ]; then
   docker buildx inspect ci-toolkit >/dev/null 2>&1 \
     || docker buildx create --name ci-toolkit --driver docker-container >/dev/null
