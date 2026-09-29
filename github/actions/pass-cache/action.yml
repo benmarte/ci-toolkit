@@ -78,7 +78,7 @@ runs:
           --backend registry --ref "${{ steps.ref.outputs.ref }}" --key "${{ steps.key.outputs.key }}"
     - id: check-gha
       if: inputs.mode == 'check' && inputs.backend == 'gha'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: .ci-toolkit-pass
         key: ${{ steps.key.outputs.key }}
@@ -94,7 +94,7 @@ runs:
       shell: bash
       run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
     - if: inputs.mode == 'save' && inputs.backend == 'gha'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       continue-on-error: true
       with:
         path: .ci-toolkit-pass

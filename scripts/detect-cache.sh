@@ -67,7 +67,7 @@ add() { # add MANAGER "lockfile..." "path..."
 
 # Resolve a tool's own cache location when the tool is installed, since users
 # and images relocate them; otherwise fall back to the documented default.
-goenv() { command -v go >/dev/null 2>&1 && go env "$1" 2>/dev/null || true; }
+goenv() { if command -v go >/dev/null 2>&1; then go env "$1" 2>/dev/null || true; fi; }
 
 if wanted go; then
   lf="$(find_files go.sum | tr '\n' ' ')"
@@ -88,14 +88,14 @@ fi
 if wanted pnpm; then
   lf="$(find_files pnpm-lock.yaml | tr '\n' ' ')"
   if [ -n "$lf" ]; then
-    store="$(command -v pnpm >/dev/null 2>&1 && pnpm store path 2>/dev/null || true)"
+    store=""; if command -v pnpm >/dev/null 2>&1; then store="$(pnpm store path 2>/dev/null || true)"; fi
     add pnpm "$lf" "${store:-$HOME/.local/share/pnpm/store}"
   fi
 fi
 if wanted yarn; then
   lf="$(find_files yarn.lock | tr '\n' ' ')"
   if [ -n "$lf" ]; then
-    ydir="$(command -v yarn >/dev/null 2>&1 && (yarn config get cacheFolder 2>/dev/null || yarn cache dir 2>/dev/null) | tail -1 || true)"
+    ydir=""; if command -v yarn >/dev/null 2>&1; then ydir="$( (yarn config get cacheFolder 2>/dev/null || yarn cache dir 2>/dev/null) | tail -1)"; fi
     add yarn "$lf" "${ydir:-$HOME/.cache/yarn}"
   fi
 fi

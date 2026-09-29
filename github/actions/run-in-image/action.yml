@@ -119,7 +119,7 @@ runs:
           --backend registry --ref "$ref" --key "${{ steps.passkey.outputs.key }}"
     - id: pass-gha
       if: inputs.pass-name != '' && inputs.pass-backend == 'gha'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: .ci-toolkit-pass
         key: ${{ steps.passkey.outputs.key }}
@@ -158,7 +158,7 @@ runs:
           printf 'volumes<<EOF\n%sEOF\n' "$vols"
         } >> "$GITHUB_OUTPUT"
     - if: steps.cachedirs.outputs.dir != ''
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ steps.cachedirs.outputs.dir }}
         # Rolling: build/test caches change without the lockfile changing.
@@ -219,14 +219,14 @@ runs:
       shell: bash
       run: mkdir -p .ci-toolkit-pass && date -u > .ci-toolkit-pass/marker
     - if: success() && steps.run.outcome == 'success' && inputs.pass-name != '' && inputs.pass-backend == 'gha'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       continue-on-error: true
       with:
         path: .ci-toolkit-pass
         key: ${{ steps.passkey.outputs.key }}
 
     - if: always() && steps.gate.outputs.run == 'true' && inputs.artifact-name != ''
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ inputs.artifact-path }}

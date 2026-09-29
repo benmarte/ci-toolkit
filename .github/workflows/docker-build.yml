@@ -98,7 +98,7 @@ jobs:
       built: ${{ steps.build.outputs.built }}
       hash: ${{ steps.build.outputs.hash }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Cloned outside the workspace so it can never enter the build context.
       - name: Fetch ci-toolkit
         shell: bash
@@ -109,7 +109,7 @@ jobs:
           d="$RUNNER_TEMP/ci-toolkit"; mkdir -p "$d"; cd "$d"
           git init -q && git fetch -q --depth 1 "https://github.com/$REPO" "$REF" && git checkout -q FETCH_HEAD
           echo "CI_TOOLKIT=$d" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Registry login
         shell: bash
         env:

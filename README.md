@@ -78,7 +78,7 @@ Or use the composite actions inside your own jobs:
 
 ```yaml
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: benmarte/ci-toolkit/github/actions/setup-cache@v1
         with: { managers: go, rolling: "true" }
       - id: pass

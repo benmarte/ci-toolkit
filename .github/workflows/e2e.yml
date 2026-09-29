@@ -96,7 +96,7 @@ jobs:
       matrix:
         shard: ${{ fromJSON(inputs.shards) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fetch ci-toolkit
         shell: bash
         env:

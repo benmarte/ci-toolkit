@@ -65,14 +65,14 @@ runs:
         fi
     - id: save
       if: steps.detect.outputs.key != '' && inputs.save == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ${{ steps.detect.outputs.paths }}
         key: ${{ steps.keys.outputs.key }}
         restore-keys: ${{ steps.keys.outputs.restore-keys }}
     - id: restore
       if: steps.detect.outputs.key != '' && inputs.save != 'true'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ${{ steps.detect.outputs.paths }}
         key: ${{ steps.keys.outputs.key }}
